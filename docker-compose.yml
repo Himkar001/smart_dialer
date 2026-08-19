@@ -1,44 +1,42 @@
-version: "3.8"
-
 services:
+
   postgres:
     image: postgres:15-alpine
-    container_name: smartdialer_postgres
+    restart: unless-stopped
     environment:
       POSTGRES_DB: smartdialer
       POSTGRES_USER: smartdialer
-      POSTGRES_PASSWORD: smartdialer_pass
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: smartdialer
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U smartdialer"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+    ports:
+      - "5432:5432"
 
   redis:
     image: redis:7-alpine
-    container_name: smartdialer_redis
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+    ports:
+      - "6379:6379"
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: smartdialer_backend
+    restart: unless-stopped
+    env_file: ./backend/.env
     environment:
-      DATABASE_URL: postgresql+asyncpg://smartdialer:smartdialer_pass@postgres:5432/smartdialer
+      DATABASE_URL: postgresql+asyncpg://smartdialer:smartdialer@postgres:5432/smartdialer
       REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/1
-      CELERY_RESULT_BACKEND: redis://redis:6379/2
     ports:
       - "8000:8000"
     depends_on:
@@ -46,39 +44,47 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend:/app
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: >
+      sh -c "
+        alembic upgrade head &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: smartdialer_worker
+    restart: unless-stopped
+    env_file: ./backend/.env
     environment:
-      DATABASE_URL: postgresql+asyncpg://smartdialer:smartdialer_pass@postgres:5432/smartdialer
+      DATABASE_URL: postgresql+asyncpg://smartdialer:smartdialer@postgres:5432/smartdialer
       REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/1
-      CELERY_RESULT_BACKEND: redis://redis:6379/2
     depends_on:
-      - backend
-      - redis
-    volumes:
-      - ./backend:/app
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
     command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: smartdialer_frontend
+    restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "3000:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     environment:
-      VITE_API_URL: http://localhost:8000
-      VITE_WS_URL: ws://localhost:8000
+      - VITE_API_URL=http://localhost:8000
 
 volumes:
-  postgres_data:
+  pgdata:

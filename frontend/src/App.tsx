@@ -7,7 +7,8 @@ import { SimulationControls } from '@/components/SimulationControls'
 import { ProviderHealth } from '@/components/ProviderHealth'
 import { PacingChart } from '@/components/PacingChart'
 import { SafetyLog } from '@/components/SafetyLog'
-import { cn, formatTime, safetyActionColor } from '@/lib/utils'
+import { FailureScenarios } from '@/components/FailureScenarios'
+import { cn, safetyActionColor } from '@/lib/utils'
 
 type Theme = 'dark' | 'light'
 
@@ -40,19 +41,16 @@ export default function App() {
   const [simRunning, setSimRunning] = useState(false)
   const { metrics, wsStatus } = useMetrics()
 
-  // Rolling history for pacing chart (last 30 points)
   const [pacingHistory, setPacingHistory] = useState<PacingPoint[]>([])
   const [safetyLog, setSafetyLog] = useState<SafetyEntry[]>([])
   const lastDecision = useRef<string | null>(null)
 
   useEffect(() => { document.documentElement.className = theme }, [theme])
 
-  // Update pacing history when metrics arrive
   useEffect(() => {
     if (!metrics) return
     const pacing = metrics.pacing
     if (!pacing) return
-
     const point: PacingPoint = {
       time: new Date(metrics.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
       requested: pacing.dial_count_requested ?? 0,
@@ -62,30 +60,27 @@ export default function App() {
     }
     setPacingHistory(prev => [...prev.slice(-29), point])
 
-    // Append to safety log on new decision
     const decision = metrics.safety?.last_decision
-    const reason = metrics.safety?.last_reason
+    const reason   = metrics.safety?.last_reason
     if (decision && reason && decision !== lastDecision.current) {
       lastDecision.current = decision
       setSafetyLog(prev => [...prev.slice(-99), {
         time: new Date(metrics.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        action: decision,
-        reason,
-        approved: pacing.dial_count_approved ?? 0,
+        action: decision, reason,
+        approved:  pacing.dial_count_approved ?? 0,
         requested: pacing.dial_count_requested ?? 0,
       }])
     }
   }, [metrics])
 
   const abandonedRate = metrics?.safety?.abandoned_rate ?? 0
-  const abandonedPct = (abandonedRate * 100).toFixed(1)
-  const answerRate = metrics?.pacing?.answer_rate ?? 0
-  const answerPct = (answerRate * 100).toFixed(1)
-  const sampleSize = (metrics?.pacing as any)?.sample_size ?? 0
-  const lastAction = metrics?.safety?.last_decision
-  const mode = metrics?.pacing?.mode ?? 'PROGRESSIVE'
-
-  const activeCalls = (metrics?.calls.initiated ?? 0) + (metrics?.calls.ringing ?? 0) + (metrics?.calls.connected ?? 0)
+  const abandonedPct  = (abandonedRate * 100).toFixed(1)
+  const answerRate    = metrics?.pacing?.answer_rate ?? 0
+  const answerPct     = (answerRate * 100).toFixed(1)
+  const sampleSize    = (metrics?.pacing as any)?.sample_size ?? 0
+  const lastAction    = metrics?.safety?.last_decision
+  const mode          = metrics?.pacing?.mode ?? 'PROGRESSIVE'
+  const activeCalls   = (metrics?.calls.initiated ?? 0) + (metrics?.calls.ringing ?? 0) + (metrics?.calls.connected ?? 0)
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -130,17 +125,17 @@ export default function App() {
         </div>
       </header>
 
-      {/* ── Main ──────────────────────────────────────────────────── */}
-      <main className="p-6 max-w-screen-2xl mx-auto">
+      {/* ── Main ──────────────────────────────────────────────── */}
+      <main className="p-6 max-w-screen-2xl mx-auto space-y-5">
 
         {/* KPI Strip */}
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-5">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
           {[
             { label: 'Available',    value: metrics?.agents.available ?? '—',  color: 'text-emerald-400' },
             { label: 'Active Calls', value: activeCalls,                        color: 'text-violet-400'  },
             { label: 'Completed',    value: metrics?.calls.completed ?? '—',   color: 'text-blue-400'    },
             { label: 'Failed',       value: metrics?.calls.failed ?? '—',      color: abandonedRate > 0.03 ? 'text-red-400' : 'text-slate-400' },
-            { label: 'Answer Rate',  value: sampleSize > 0 ? `${answerPct}%` : 'N/A', color: answerRate > 0.6 ? 'text-emerald-400' : 'text-amber-400' },
+            { label: 'Answer Rate',  value: sampleSize > 0 ? `${answerPct}%` : 'Warming…', color: answerRate > 0.6 ? 'text-emerald-400' : 'text-amber-400' },
             { label: 'Mode',         value: mode,                               color: mode === 'PREDICTIVE' ? 'text-violet-400' : 'text-sky-400' },
           ].map(kpi => (
             <div key={kpi.label} className="rounded-xl border border-border bg-card px-4 py-3">
@@ -150,28 +145,32 @@ export default function App() {
           ))}
         </div>
 
-        {/* Main grid: 4 columns on large screens */}
+        {/* Row 1: Controls | Agent Pool | Call Metrics | Provider Health */}
         <div className="grid gap-4 lg:grid-cols-4">
+          <SimulationControls
+            isRunning={simRunning}
+            onStart={() => setSimRunning(true)}
+            onStop={() => setSimRunning(false)}
+          />
+          <AgentPool agents={metrics?.agents} />
+          <CallMetrics calls={metrics?.calls} />
+          <ProviderHealth health={metrics?.provider_health} />
+        </div>
 
-          {/* Col 1: Controls + Provider Health */}
-          <div className="space-y-4">
-            <SimulationControls
-              isRunning={simRunning}
-              onStart={() => setSimRunning(true)}
-              onStop={() => setSimRunning(false)}
-            />
-            <ProviderHealth health={metrics?.provider_health} />
+        {/* Row 2: Pacing Chart | Safety Log | Answer Rate Tracker | Safety Rules */}
+        <div className="grid gap-4 lg:grid-cols-4">
+          <div className="lg:col-span-2">
+            <PacingChart history={pacingHistory} />
           </div>
+          <SafetyLog entries={safetyLog} />
 
-          {/* Col 2: Agent Pool */}
-          <div className="space-y-4">
-            <AgentPool agents={metrics?.agents} />
-
+          {/* Answer Rate + Safety Rules */}
+          <div className="space-y-3">
             {/* Answer Rate Tracker */}
             <div className="rounded-xl border border-border bg-card p-4">
               <div className="flex items-center gap-2 mb-3">
                 <TrendingUp className="h-4 w-4 text-primary" />
-                <h3 className="text-sm font-semibold">Answer Rate Tracker</h3>
+                <h3 className="text-sm font-semibold">Answer Rate</h3>
               </div>
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
@@ -184,51 +183,30 @@ export default function App() {
                   <span className="text-muted-foreground">Samples</span>
                   <span className="font-medium">{sampleSize} / 10 min</span>
                 </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Status</span>
-                  <span className={cn('text-xs font-medium rounded-full px-2 py-0.5',
-                    sampleSize >= 10 ? 'bg-emerald-500/10 text-emerald-400' : 'bg-amber-500/10 text-amber-400'
-                  )}>
-                    {sampleSize >= 10 ? 'Warm' : 'Cold Start'}
-                  </span>
-                </div>
                 {sampleSize < 10 && (
-                  <div className="mt-2 h-1.5 w-full rounded-full bg-muted">
-                    <div
-                      className="h-1.5 rounded-full bg-amber-400 transition-all"
-                      style={{ width: `${(sampleSize / 10) * 100}%` }}
-                    />
+                  <div className="h-1.5 w-full rounded-full bg-muted">
+                    <div className="h-1.5 rounded-full bg-amber-400 transition-all"
+                      style={{ width: `${(sampleSize / 10) * 100}%` }} />
                   </div>
                 )}
               </div>
             </div>
-          </div>
 
-          {/* Col 3: Call Metrics + Pacing Chart */}
-          <div className="space-y-4">
-            <CallMetrics calls={metrics?.calls} />
-            <PacingChart history={pacingHistory} />
-          </div>
-
-          {/* Col 4: Safety Log + Pacing info */}
-          <div className="space-y-4">
-            <SafetyLog entries={safetyLog} />
-
-            {/* Safety decision detail */}
+            {/* Safety Rules */}
             <div className="rounded-xl border border-border bg-card p-4">
               <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">
-                Safety Rules (Priority Order)
+                Safety Rules
               </h3>
-              <div className="space-y-2 text-xs">
+              <div className="space-y-1.5 text-xs">
                 {[
-                  { action: 'FALLBACK', rule: 'Abandoned > 3%', color: 'text-orange-400' },
-                  { action: 'REJECT',   rule: 'Health < 0.40',  color: 'text-red-400'    },
-                  { action: 'REDUCE',   rule: 'Health < 0.70 or ratio > 3×', color: 'text-amber-400' },
-                  { action: 'APPROVE',  rule: 'All thresholds met',           color: 'text-emerald-400' },
+                  { action: 'FALLBACK', rule: 'Abandoned > 3%',        color: 'text-orange-400' },
+                  { action: 'REJECT',   rule: 'Health < 0.40',          color: 'text-red-400'    },
+                  { action: 'REDUCE',   rule: 'Health < 0.70 or 3× cap', color: 'text-amber-400' },
+                  { action: 'APPROVE',  rule: 'All thresholds OK',       color: 'text-emerald-400' },
                 ].map((row, i) => (
                   <div key={row.action} className={cn(
-                    'flex items-center gap-2 rounded p-1.5',
-                    lastAction === row.action ? 'bg-muted' : ''
+                    'flex items-center gap-2 rounded p-1',
+                    lastAction === row.action && 'bg-muted'
                   )}>
                     <span className="text-muted-foreground w-4">{i + 1}.</span>
                     <span className={cn('font-semibold w-16', row.color)}>{row.action}</span>
@@ -243,13 +221,16 @@ export default function App() {
           </div>
         </div>
 
-        {/* Empty state */}
+        {/* Row 3: Failure Scenarios (full width) */}
+        <FailureScenarios isRunning={simRunning} />
+
+        {/* Empty State */}
         {!simRunning && !metrics?.agents.total && (
-          <div className="mt-6 rounded-xl border border-dashed border-border p-10 text-center">
+          <div className="rounded-xl border border-dashed border-border p-10 text-center">
             <Phone className="h-10 w-10 text-muted-foreground mx-auto mb-3" />
             <h3 className="text-lg font-semibold mb-1">No simulation running</h3>
             <p className="text-sm text-muted-foreground">
-              Select mode, agents, provider — then click <strong>Start Simulation</strong>
+              Choose mode + provider → <strong>Start Simulation</strong> → trigger failure scenarios to demo resilience
             </p>
           </div>
         )}
