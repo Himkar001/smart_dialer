@@ -1,11 +1,21 @@
-"""Simulation control router."""
+"""Simulation control + failure scenario router."""
 
 import logging
+from dataclasses import asdict
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.providers.registry import get_all_providers
+from app.services.failure_scenarios import (
+    SCENARIO_REGISTRY,
+    incident_log,
+    trigger_agent_drop,
+    trigger_duplicate_storm,
+    trigger_ooo_flood,
+    trigger_provider_outage,
+    trigger_worker_crash,
+)
 from app.services.simulation_runner import (
     get_simulation_state,
     start_simulation,
@@ -27,6 +37,8 @@ class StartSimulationRequest(BaseModel):
 @router.post("/start")
 async def start(payload: StartSimulationRequest) -> dict:
     """Start a new simulation. Stops any existing simulation first."""
+    # Clear incident log for fresh run
+    incident_log.clear()
     campaign_id = await start_simulation(
         agent_count=payload.agent_count,
         borrower_count=payload.borrower_count,
@@ -67,62 +79,55 @@ async def status() -> dict:
 @router.post("/trigger/{scenario}")
 async def trigger_scenario(scenario: str) -> dict:
     """
-    Trigger a failure scenario for demonstration.
-    Available: provider-outage, provider-restore, agent-drop (Sprint 4 full implementation).
+    Trigger one of 5 failure scenarios.
+
+    Available scenarios:
+      - provider-outage   : ProviderB health → 0.1, auto-recovers in 15s
+      - worker-crash      : Cancel call tasks, stale agents auto-released in 3s
+      - agent-drop        : 50% agents → OFFLINE, auto-restore in 20s
+      - duplicate-storm   : 5 duplicate events per active call (all absorbed)
+      - ooo-flood         : OOO COMPLETED events (all rejected by SM)
     """
     state = get_simulation_state()
-    if not state.is_running:
-        raise HTTPException(status_code=400, detail="No simulation running")
+    campaign_id = state.campaign_id
 
-    providers = get_all_providers()
-
-    if scenario == "provider-outage":
-        from app.providers.provider_b import ProviderB
-        pb = providers.get("PROVIDER_B")
-        if isinstance(pb, ProviderB):
-            pb.simulate_outage()
-        return {"message": "Provider B outage triggered — health set to 0.1"}
-
-    elif scenario == "provider-restore":
-        from app.providers.provider_b import ProviderB
-        pb = providers.get("PROVIDER_B")
-        if isinstance(pb, ProviderB):
-            pb.restore()
-        return {"message": "Provider B restored"}
-
-    elif scenario == "agent-drop":
-        # Sprint 4: set 40% of agents to OFFLINE
-        from sqlalchemy import select
-        from app.database import AsyncSessionLocal
-        from app.models.agent import Agent, AgentState
-
-        if state.campaign_id:
-            async with AsyncSessionLocal() as db:
-                async with db.begin():
-                    result = await db.execute(
-                        select(Agent)
-                        .where(Agent.campaign_id == state.campaign_id)
-                        .where(Agent.state == AgentState.AVAILABLE)
-                    )
-                    agents = result.scalars().all()
-                    drop_count = max(1, len(agents) // 2)
-                    for agent in agents[:drop_count]:
-                        agent.state = AgentState.OFFLINE
-            return {"message": f"Dropped {drop_count} agents to OFFLINE"}
-        return {"message": "No active campaign"}
-
-    else:
+    if scenario not in SCENARIO_REGISTRY:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown scenario: {scenario!r}. Valid: provider-outage, provider-restore, agent-drop",
+            detail=f"Unknown scenario: '{scenario}'. Valid: {', '.join(SCENARIO_REGISTRY.keys())}",
         )
+
+    # Scenarios requiring campaign_id
+    if scenario in ("agent-drop", "duplicate-storm", "ooo-flood"):
+        if not campaign_id:
+            raise HTTPException(status_code=400, detail="No active simulation")
+
+    if scenario == "provider-outage":
+        return await trigger_provider_outage("PROVIDER_B")
+
+    elif scenario == "worker-crash":
+        return await trigger_worker_crash(campaign_id)
+
+    elif scenario == "agent-drop":
+        return await trigger_agent_drop(campaign_id)
+
+    elif scenario == "duplicate-storm":
+        return await trigger_duplicate_storm(campaign_id)
+
+    elif scenario == "ooo-flood":
+        return await trigger_ooo_flood(campaign_id)
+
+    raise HTTPException(status_code=500, detail="Scenario handler not found")
+
+
+@router.get("/incidents")
+async def get_incidents() -> list[dict]:
+    """Return the incident timeline for the current simulation run."""
+    return [asdict(entry) for entry in incident_log]
 
 
 @router.get("/provider-health")
 async def provider_health() -> dict:
     """Current health scores for all providers."""
     providers = get_all_providers()
-    health = {}
-    for name, p in providers.items():
-        health[name] = await p.get_health_score()
-    return health
+    return {name: await p.get_health_score() for name, p in providers.items()}

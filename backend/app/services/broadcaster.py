@@ -111,8 +111,14 @@ async def collect_metrics(db: AsyncSession) -> dict:
         "abandoned_rate": abandoned_rate,
     }
 
+    # Recent incidents (last 10 for WS payload size)
+    from app.services.failure_scenarios import incident_log
+    from dataclasses import asdict
+    recent_incidents = [asdict(e) for e in incident_log[-10:]]
+
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "incidents": recent_incidents,
         "agents": {
             "total": sum(agent_counts.values()),
             "offline":   agent_counts.get("OFFLINE", 0),
