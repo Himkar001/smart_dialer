@@ -1,8 +1,8 @@
 """
 WebSocket Connection Manager + Metrics Broadcaster.
 
-Broadcasts a real-time MetricsSnapshot to all connected dashboard clients
-every 2 seconds. Uses asyncio.gather to send to all connections concurrently.
+Broadcasts a real-time MetricsSnapshot (including pacing + safety decisions)
+to all connected dashboard clients every 2 seconds.
 """
 
 import asyncio
@@ -13,15 +13,13 @@ from fastapi import WebSocket
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.agent import Agent, AgentState
+from app.models.agent import Agent
 from app.models.call import Call, CallState
 
 logger = logging.getLogger(__name__)
 
 
 class ConnectionManager:
-    """Manages all active WebSocket connections."""
-
     def __init__(self) -> None:
         self._connections: list[WebSocket] = []
 
@@ -31,13 +29,11 @@ class ConnectionManager:
         logger.info("WebSocket connected (total=%d)", len(self._connections))
 
     def disconnect(self, ws: WebSocket) -> None:
-        self._connections.discard if hasattr(self._connections, "discard") else None
         if ws in self._connections:
             self._connections.remove(ws)
         logger.info("WebSocket disconnected (total=%d)", len(self._connections))
 
     async def broadcast(self, data: dict) -> None:
-        """Send JSON to all connected clients; remove dead connections."""
         dead = []
         for ws in list(self._connections):
             try:
@@ -52,28 +48,25 @@ class ConnectionManager:
         return len(self._connections)
 
 
-# Global singleton used by the WebSocket router and the background broadcaster
 manager = ConnectionManager()
 
 
 async def collect_metrics(db: AsyncSession) -> dict:
-    """Query current state counts and return a MetricsSnapshot dict."""
+    """Query DB + in-process state for a full MetricsSnapshot."""
 
     # Agent counts by state
     agent_rows = await db.execute(
-        select(Agent.state, func.count(Agent.id))
-        .group_by(Agent.state)
+        select(Agent.state, func.count(Agent.id)).group_by(Agent.state)
     )
     agent_counts: dict[str, int] = {row[0].value: row[1] for row in agent_rows}
 
     # Call counts by state
     call_rows = await db.execute(
-        select(Call.state, func.count(Call.id))
-        .group_by(Call.state)
+        select(Call.state, func.count(Call.id)).group_by(Call.state)
     )
     call_counts: dict[str, int] = {row[0].value: row[1] for row in call_rows}
 
-    # Provider health scores
+    # Provider health
     from app.providers.registry import get_all_providers
     providers = get_all_providers()
     provider_health: dict[str, float] = {}
@@ -88,48 +81,65 @@ async def collect_metrics(db: AsyncSession) -> dict:
     total_finished = total_completed + total_failed
     abandoned_rate = round(total_failed / total_finished, 4) if total_finished > 0 else 0.0
 
+    # Last safety decision
+    from app.services import _last_safety_decision_store
+    from app.services.simulation_runner import get_simulation_state
+    last_decision = _last_safety_decision_store.get("last")
+    sim_state = get_simulation_state()
+
+    # Answer rate from tracker
+    from app.services.answer_rate_tracker import tracker as answer_tracker
+    answer_rate = 0.0
+    if sim_state.campaign_id:
+        ar = answer_tracker.get_answer_rate(str(sim_state.campaign_id))
+        answer_rate = ar if ar is not None else 0.0
+
+    pacing_info = {
+        "mode": sim_state.mode if sim_state.is_running else "PROGRESSIVE",
+        "dial_count_requested": last_decision.requested_count if last_decision else 0,
+        "dial_count_approved": last_decision.approved_count if last_decision else 0,
+        "answer_rate": round(answer_rate, 4),
+        "provider_health": max(provider_health.values()) if provider_health else 0.0,
+        "sample_size": answer_tracker.get_sample_size(
+            str(sim_state.campaign_id) if sim_state.campaign_id else ""
+        ),
+    }
+
+    safety_info = {
+        "last_decision": last_decision.action.value if last_decision else None,
+        "last_reason": last_decision.reason if last_decision else None,
+        "abandoned_rate": abandoned_rate,
+    }
+
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "agents": {
             "total": sum(agent_counts.values()),
-            "offline": agent_counts.get("OFFLINE", 0),
+            "offline":   agent_counts.get("OFFLINE", 0),
             "available": agent_counts.get("AVAILABLE", 0),
-            "reserved": agent_counts.get("RESERVED", 0),
-            "dialing": agent_counts.get("DIALING", 0),
+            "reserved":  agent_counts.get("RESERVED", 0),
+            "dialing":   agent_counts.get("DIALING", 0),
             "connected": agent_counts.get("CONNECTED", 0),
-            "wrap_up": agent_counts.get("WRAP_UP", 0),
-            "paused": agent_counts.get("PAUSED", 0),
+            "wrap_up":   agent_counts.get("WRAP_UP", 0),
+            "paused":    agent_counts.get("PAUSED", 0),
         },
         "calls": {
-            "queued": call_counts.get("QUEUED", 0),
+            "queued":    call_counts.get("QUEUED", 0),
             "initiated": call_counts.get("INITIATED", 0),
-            "ringing": call_counts.get("RINGING", 0),
+            "ringing":   call_counts.get("RINGING", 0),
             "connected": call_counts.get("CONNECTED", 0),
             "completed": total_completed,
-            "failed": total_failed,
+            "failed":    total_failed,
             "cancelled": call_counts.get("CANCELLED", 0),
         },
         "provider_health": provider_health,
-        "safety": {
-            "last_decision": None,
-            "last_reason": None,
-            "abandoned_rate": abandoned_rate,
-        },
-        "pacing": {
-            "mode": "PROGRESSIVE",
-            "dial_count_requested": 0,
-            "dial_count_approved": 0,
-            "answer_rate": 0.0,
-            "provider_health": provider_health.get("PROVIDER_A", 0.0),
-        },
+        "pacing": pacing_info,
+        "safety": safety_info,
     }
 
 
 async def broadcast_loop(get_db_session) -> None:
-    """
-    Background task: collect metrics and broadcast every 2 seconds.
-    Started on FastAPI startup, runs until shutdown.
-    """
+    """Push metrics to all connected WebSocket clients every 2 seconds."""
     logger.info("Metrics broadcast loop starting")
     while True:
         try:

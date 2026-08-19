@@ -1,11 +1,11 @@
 """
-Progressive Dialer — core dialing logic.
+Progressive & Predictive Dialer — core dialing logic.
 
-Progressive mode: dial exactly N calls where N = number of AVAILABLE agents.
-This is the strict 1:1 guarantee — zero risk of abandoned calls.
+Progressive mode: dial exactly N calls where N = available_agents (strict 1:1).
+Predictive mode:  request more than N, route through Safety Controller,
+                  use approved_count from pacing engine.
 
-Architecture note: This module contains pure dialing logic.
-It is called by the simulation runner, which handles DB session lifecycle.
+Both modes pass through the Safety Controller — no bypass is possible.
 """
 
 import asyncio
@@ -30,42 +30,32 @@ logger = logging.getLogger(__name__)
 
 def progressive_dial_count(available_agents: int, in_flight_calls: int) -> int:
     """
-    Progressive mode: dial exactly as many calls as there are available agents.
+    Progressive mode: dial exactly as many calls as available agents.
 
-    Args:
-        available_agents: Agents currently in AVAILABLE state.
-        in_flight_calls: Calls currently INITIATED/RINGING/ANSWERED/CONNECTED.
-
-    Returns:
-        Number of new calls to place. Always >= 0.
-
-    The strict invariant: total_active_calls <= total_agent_capacity.
-    We only place calls for agents that are free RIGHT NOW.
+    Strict 1:1 guarantee — no risk of abandoned calls.
     """
-    to_dial = max(0, available_agents)
-    logger.debug(
-        "progressive_dial_count: available=%d in_flight=%d → dial=%d",
-        available_agents, in_flight_calls, to_dial,
-    )
-    return to_dial
+    return max(0, available_agents)
 
 
 async def run_call_simulation(
     db: AsyncSession,
     call_id: uuid.UUID,
     agent_id: uuid.UUID,
+    campaign_id: uuid.UUID,
     provider: TelecomProvider,
     answer_rate_override: float | None = None,
+    mode: str = "PROGRESSIVE",
 ) -> None:
     """
-    Background task: process all provider events for a single call to completion.
-    Updates call state machine and releases the agent when done.
+    Background task: process all provider events for a single call.
+    Records outcome in AnswerRateTracker after completion.
     """
     from sqlalchemy import select
     from app.models.agent import Agent
-    from app.models.call import Call
+    from app.services.answer_rate_tracker import tracker as answer_tracker
 
-    logger.info("run_call_simulation: call %s starting event loop", call_id)
+    answered = False
+    logger.info("run_call_simulation: call %s starting event loop [%s]", call_id, provider.name)
 
     try:
         async for event_type, idempotency_key in provider.simulate_call_events(
@@ -74,14 +64,29 @@ async def run_call_simulation(
             async with db.begin():
                 await process_provider_event(db, call_id, event_type, idempotency_key)
 
-        # Call complete — transition agent to WRAP_UP then AVAILABLE
+            if event_type == "CONNECTED":
+                answered = True
+
+        # Record outcome for answer rate tracker
+        answer_tracker.record(str(campaign_id), answered)
+        logger.debug(
+            "run_call_simulation: call %s complete — answered=%s (tracker sample=%d)",
+            call_id, answered, answer_tracker.get_sample_size(str(campaign_id)),
+        )
+
+    except Exception as e:
+        logger.error("run_call_simulation: call %s ERROR: %s", call_id, e)
+        answer_tracker.record(str(campaign_id), False)
+
+    # Release agent: WRAP_UP → AVAILABLE
+    try:
         async with db.begin():
             result = await db.execute(select(Agent).where(Agent.id == agent_id))
             agent = result.scalar_one_or_none()
-            if agent and agent.state in (AgentState.DIALING, AgentState.CONNECTED):
+            if agent and agent.state in (AgentState.DIALING, AgentState.CONNECTED, AgentState.ANSWERED):
                 await transition_agent(db, agent, AgentState.WRAP_UP)
 
-        await asyncio.sleep(0.5)  # Brief wrap-up
+        await asyncio.sleep(0.5)
 
         async with db.begin():
             result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -89,66 +94,111 @@ async def run_call_simulation(
             if agent and agent.state == AgentState.WRAP_UP:
                 await transition_agent(db, agent, AgentState.AVAILABLE)
 
-        logger.info("run_call_simulation: call %s complete, agent %s released", call_id, agent_id)
+        logger.debug("run_call_simulation: agent %s released to AVAILABLE", agent_id)
 
-    except Exception as e:
-        logger.error("run_call_simulation: call %s ERROR: %s", call_id, e)
-        # Emergency release — get agent back to AVAILABLE
+    except Exception as release_err:
+        logger.error("run_call_simulation: failed to release agent %s: %s", agent_id, release_err)
         try:
             async with db.begin():
                 result = await db.execute(select(Agent).where(Agent.id == agent_id))
                 agent = result.scalar_one_or_none()
                 if agent and agent.state not in (AgentState.AVAILABLE, AgentState.OFFLINE):
                     await transition_agent(db, agent, AgentState.AVAILABLE)
-        except Exception as release_err:
-            logger.error("run_call_simulation: failed to release agent %s: %s", agent_id, release_err)
+        except Exception:
+            pass
 
 
+async def dialing_cycle(
+    db: AsyncSession,
+    campaign: Campaign,
+    provider: TelecomProvider,
+    answer_rate_override: float | None = None,
+) -> dict:
+    """
+    Execute one dialing cycle for any mode: calculate → safety gate → allocate → simulate.
+
+    Returns a summary dict with pacing decision details for the broadcaster.
+    """
+    from app.services.call_state_machine import count_calls_by_state
+    from app.services.pacing_engine import compute_pacing_decision
+
+    available = await count_available_agents(db, campaign.id)
+    in_flight = await count_calls_by_state(
+        db, campaign.id,
+        [CallState.INITIATED, CallState.RINGING, CallState.ANSWERED, CallState.CONNECTED],
+    )
+
+    # Count completed + failed for abandoned rate
+    completed = await count_calls_by_state(db, campaign.id, [CallState.COMPLETED])
+    failed = await count_calls_by_state(db, campaign.id, [CallState.FAILED, CallState.CANCELLED])
+    total_finished = completed + failed
+    abandoned_rate = failed / total_finished if total_finished > 0 else 0.0
+
+    # Provider health
+    provider_health = await provider.get_health_score()
+
+    # Compute pacing decision (pacing engine → safety controller)
+    mode = campaign.mode.value if hasattr(campaign.mode, "value") else str(campaign.mode)
+    decision = await compute_pacing_decision(
+        campaign_id=campaign.id,
+        available_agents=available,
+        in_flight_calls=in_flight,
+        provider_health=provider_health,
+        abandoned_rate=abandoned_rate,
+        mode=mode,
+    )
+
+    # Store last decision for broadcaster
+    from app.services import _last_safety_decision_store
+    _last_safety_decision_store["last"] = decision
+
+    if decision.approved_count == 0:
+        logger.debug("dialing_cycle: approved=0 (%s) — skipping", decision.action)
+        return {
+            "placed": 0, "decision": decision.action.value,
+            "reason": decision.reason, "available": available,
+        }
+
+    # Allocate and launch simulations
+    placed = 0
+    for _ in range(decision.approved_count):
+        async with db.begin():
+            result = await allocate_and_dial(db, campaign, provider, answer_rate_override)
+
+        if result is None:
+            break
+
+        call, agent = result
+        placed += 1
+
+        asyncio.create_task(
+            run_call_simulation(
+                db, call.id, agent.id, campaign.id,
+                provider, answer_rate_override, mode,
+            ),
+            name=f"call-sim-{call.id}",
+        )
+
+    logger.info(
+        "dialing_cycle: campaign=%s mode=%s placed=%d/%d [%s]",
+        campaign.id, mode, placed, decision.approved_count, decision.action,
+    )
+    return {
+        "placed": placed,
+        "decision": decision.action.value,
+        "reason": decision.reason,
+        "available": available,
+        "requested": decision.requested_count,
+        "approved": decision.approved_count,
+    }
+
+
+# Backwards-compat alias used by simulation_runner
 async def progressive_dialing_cycle(
     db: AsyncSession,
     campaign: Campaign,
     provider: TelecomProvider,
     answer_rate_override: float | None = None,
 ) -> int:
-    """
-    Execute one progressive dialing cycle: calculate → allocate → launch simulations.
-
-    Returns the number of calls placed this cycle.
-    """
-    available = await count_available_agents(db, campaign.id)
-    in_flight = await count_calls_by_state(
-        db, campaign.id,
-        [CallState.INITIATED, CallState.RINGING, CallState.ANSWERED, CallState.CONNECTED]
-    )
-
-    to_dial = progressive_dial_count(available, in_flight)
-
-    if to_dial == 0:
-        logger.debug("progressive_dialing_cycle: nothing to dial (available=%d)", available)
-        return 0
-
-    placed = 0
-    tasks = []
-
-    for _ in range(to_dial):
-        async with db.begin():
-            result = await allocate_and_dial(db, campaign, provider, answer_rate_override)
-
-        if result is None:
-            break  # No more resources
-
-        call, agent = result
-        placed += 1
-
-        # Launch call simulation as background task
-        task = asyncio.create_task(
-            run_call_simulation(db, call.id, agent.id, provider, answer_rate_override),
-            name=f"call-sim-{call.id}",
-        )
-        tasks.append(task)
-
-    logger.info(
-        "progressive_dialing_cycle: campaign=%s placed=%d/%d calls",
-        campaign.id, placed, to_dial,
-    )
-    return placed
+    result = await dialing_cycle(db, campaign, provider, answer_rate_override)
+    return result.get("placed", 0)
