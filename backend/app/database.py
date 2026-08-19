@@ -7,13 +7,25 @@ from sqlalchemy.orm import DeclarativeBase
 
 from app.config import settings
 
-engine = create_async_engine(
-    settings.database_url,
-    echo=settings.app_env == "development",
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
-)
+# SQLite doesn't support pool_size/max_overflow — detect and use NullPool instead
+_is_sqlite = settings.database_url.startswith("sqlite")
+
+if _is_sqlite:
+    from sqlalchemy.pool import StaticPool
+    engine = create_async_engine(
+        settings.database_url,
+        echo=False,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+else:
+    engine = create_async_engine(
+        settings.database_url,
+        echo=settings.app_env == "development",
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+    )
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,

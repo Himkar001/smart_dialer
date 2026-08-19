@@ -27,10 +27,15 @@ def create_app() -> FastAPI:
         redoc_url="/redoc",
     )
 
-    # CORS — allow the React dashboard on port 3000
+    # CORS — allow the React dashboard (both Vite dev :5173 and production :3000)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_origins=[
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -46,7 +51,16 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def on_startup() -> None:
-        logger.info("SmartDialer API starting up — env=%s", settings.app_env)
+        logger.info("SmartDialer API starting up — env=%s db=%s",
+                    settings.app_env, settings.database_url[:30])
+
+        # Auto-create all tables (SQLite for dev, Alembic handles Postgres in prod)
+        from app.database import engine, Base
+        from app import models  # noqa: F401 — ensure all models are imported
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database tables ready")
+
         # Start the WebSocket metrics broadcast loop
         from app.services.broadcaster import broadcast_loop
         from app.database import AsyncSessionLocal
@@ -54,7 +68,7 @@ def create_app() -> FastAPI:
             broadcast_loop(AsyncSessionLocal),
             name="metrics-broadcaster",
         )
-        logger.info("Metrics broadcaster started")
+        logger.info("Metrics broadcaster started — SmartDialer ready!")
 
     @app.on_event("shutdown")
     async def on_shutdown() -> None:

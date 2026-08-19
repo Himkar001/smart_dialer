@@ -15,7 +15,11 @@ def get_provider(provider_type: ProviderType | str) -> TelecomProvider:
     Return the singleton provider instance for the given type.
     The providers are singletons so their health state persists across calls.
     """
-    key = str(provider_type).upper()
+    if isinstance(provider_type, ProviderType):
+        key = provider_type.name
+    else:
+        key = str(provider_type).upper()
+        
     if key == "PROVIDER_A":
         return _provider_a
     if key == "PROVIDER_B":

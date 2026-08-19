@@ -53,59 +53,66 @@ async def run_call_simulation(
     from sqlalchemy import select
     from app.models.agent import Agent
     from app.services.answer_rate_tracker import tracker as answer_tracker
+    from app.database import AsyncSessionLocal
 
     answered = False
     logger.info("run_call_simulation: call %s starting event loop [%s]", call_id, provider.name)
 
-    try:
-        async for event_type, idempotency_key in provider.simulate_call_events(
-            call_id, answer_rate_override
-        ):
-            async with db.begin():
-                await process_provider_event(db, call_id, event_type, idempotency_key)
-
-            if event_type == "CONNECTED":
-                answered = True
-
-        # Record outcome for answer rate tracker
-        answer_tracker.record(str(campaign_id), answered)
-        logger.debug(
-            "run_call_simulation: call %s complete — answered=%s (tracker sample=%d)",
-            call_id, answered, answer_tracker.get_sample_size(str(campaign_id)),
-        )
-
-    except Exception as e:
-        logger.error("run_call_simulation: call %s ERROR: %s", call_id, e)
-        answer_tracker.record(str(campaign_id), False)
-
-    # Release agent: WRAP_UP → AVAILABLE
-    try:
-        async with db.begin():
-            result = await db.execute(select(Agent).where(Agent.id == agent_id))
-            agent = result.scalar_one_or_none()
-            if agent and agent.state in (AgentState.DIALING, AgentState.CONNECTED, AgentState.ANSWERED):
-                await transition_agent(db, agent, AgentState.WRAP_UP)
-
-        await asyncio.sleep(0.5)
-
-        async with db.begin():
-            result = await db.execute(select(Agent).where(Agent.id == agent_id))
-            agent = result.scalar_one_or_none()
-            if agent and agent.state == AgentState.WRAP_UP:
-                await transition_agent(db, agent, AgentState.AVAILABLE)
-
-        logger.debug("run_call_simulation: agent %s released to AVAILABLE", agent_id)
-
-    except Exception as release_err:
-        logger.error("run_call_simulation: failed to release agent %s: %s", agent_id, release_err)
+    async with AsyncSessionLocal() as local_db:
         try:
-            async with db.begin():
-                result = await db.execute(select(Agent).where(Agent.id == agent_id))
+            async for event_type, idempotency_key in provider.simulate_call_events(
+                call_id, answer_rate_override
+            ):
+                async with local_db.begin():
+                    await process_provider_event(local_db, call_id, event_type, idempotency_key)
+
+                if event_type == "CONNECTED":
+                    answered = True
+
+            # Record outcome for answer rate tracker
+            answer_tracker.record(str(campaign_id), answered)
+            logger.debug(
+                "run_call_simulation: call %s complete — answered=%s (tracker sample=%d)",
+                call_id, answered, answer_tracker.get_sample_size(str(campaign_id)),
+            )
+
+        except Exception as e:
+            logger.error("run_call_simulation: call %s ERROR: %s", call_id, e)
+            answer_tracker.record(str(campaign_id), False)
+
+        # Release agent
+        try:
+            async with local_db.begin():
+                result = await local_db.execute(select(Agent).where(Agent.id == agent_id))
                 agent = result.scalar_one_or_none()
-                if agent and agent.state not in (AgentState.AVAILABLE, AgentState.OFFLINE):
-                    await transition_agent(db, agent, AgentState.AVAILABLE)
-        except Exception:
-            pass
+                
+                if agent and agent.state == AgentState.CONNECTED:
+                    # If they connected, they get wrap-up time
+                    await transition_agent(local_db, agent, AgentState.WRAP_UP)
+                elif agent and agent.state == AgentState.DIALING:
+                    # If they were just dialing (no answer), they go straight to available
+                    await transition_agent(local_db, agent, AgentState.AVAILABLE)
+
+            if answered:
+                await asyncio.sleep(0.5)  # Simulate brief wrap-up time
+                async with local_db.begin():
+                    result = await local_db.execute(select(Agent).where(Agent.id == agent_id))
+                    agent = result.scalar_one_or_none()
+                    if agent and agent.state == AgentState.WRAP_UP:
+                        await transition_agent(local_db, agent, AgentState.AVAILABLE)
+
+            logger.debug("run_call_simulation: agent %s released to AVAILABLE", agent_id)
+
+        except Exception as release_err:
+            logger.error("run_call_simulation: failed to release agent %s: %s", agent_id, release_err)
+            try:
+                async with local_db.begin():
+                    result = await local_db.execute(select(Agent).where(Agent.id == agent_id))
+                    agent = result.scalar_one_or_none()
+                    if agent and agent.state not in (AgentState.AVAILABLE, AgentState.OFFLINE):
+                        await transition_agent(local_db, agent, AgentState.AVAILABLE)
+            except Exception:
+                pass
 
 
 async def dialing_cycle(
@@ -161,6 +168,10 @@ async def dialing_cycle(
 
     # Allocate and launch simulations
     placed = 0
+    
+    # Clear implicit transaction from SELECTs (count_available_agents, etc)
+    await db.commit()
+    
     for _ in range(decision.approved_count):
         async with db.begin():
             result = await allocate_and_dial(db, campaign, provider, answer_rate_override)

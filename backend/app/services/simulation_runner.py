@@ -124,6 +124,11 @@ async def _dialing_loop(
                     break
 
                 provider = get_provider(campaign.provider)
+                
+                # Clear the implicit transaction from the SELECTs above
+                # so that dialing_cycle can manage its own db.begin() blocks
+                await db.commit()
+                
                 await progressive_dialing_cycle(db, campaign, provider, answer_rate_override)
 
         except asyncio.CancelledError:
