@@ -1,30 +1,50 @@
 import { useEffect, useState } from 'react'
-import { Phone, Activity, Shield, Zap, Server, AlertTriangle, Moon, Sun } from 'lucide-react'
-import { getHealth } from '@/lib/api'
+import { Phone, Moon, Sun, Wifi, WifiOff, Loader2 } from 'lucide-react'
+import { useMetrics } from '@/hooks/useMetrics'
+import { AgentPool } from '@/components/AgentPool'
+import { CallMetrics } from '@/components/CallMetrics'
+import { SimulationControls } from '@/components/SimulationControls'
+import { ProviderHealth } from '@/components/ProviderHealth'
+import { cn } from '@/lib/utils'
 
 type Theme = 'dark' | 'light'
 
-function App() {
-  const [theme, setTheme] = useState<Theme>('dark')
-  const [apiStatus, setApiStatus] = useState<'checking' | 'ok' | 'error'>('checking')
+function ConnectionBadge({ status }: { status: string }) {
+  if (status === 'connected')
+    return (
+      <div className="flex items-center gap-1.5 text-xs text-emerald-400">
+        <Wifi className="h-3.5 w-3.5" />Live
+      </div>
+    )
+  if (status === 'connecting')
+    return (
+      <div className="flex items-center gap-1.5 text-xs text-amber-400">
+        <Loader2 className="h-3.5 w-3.5 animate-spin" />Connecting
+      </div>
+    )
+  return (
+    <div className="flex items-center gap-1.5 text-xs text-red-400">
+      <WifiOff className="h-3.5 w-3.5" />Offline
+    </div>
+  )
+}
 
-  // Apply theme to <html> element
+export default function App() {
+  const [theme, setTheme] = useState<Theme>('dark')
+  const [simRunning, setSimRunning] = useState(false)
+  const { metrics, wsStatus } = useMetrics()
+
   useEffect(() => {
     document.documentElement.className = theme
   }, [theme])
 
-  // Check API health on mount
-  useEffect(() => {
-    getHealth()
-      .then(() => setApiStatus('ok'))
-      .catch(() => setApiStatus('error'))
-  }, [])
-
-  const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark')
+  const abandonedRate = metrics?.safety?.abandoned_rate ?? 0
+  const abandonedPct = (abandonedRate * 100).toFixed(1)
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      {/* Top Navigation Bar */}
+
+      {/* ── Header ─────────────────────────────────────────────── */}
       <header className="sticky top-0 z-50 border-b border-border bg-card/80 backdrop-blur-sm">
         <div className="flex h-14 items-center justify-between px-6">
           <div className="flex items-center gap-3">
@@ -32,31 +52,32 @@ function App() {
               <Phone className="h-4 w-4 text-primary-foreground" />
             </div>
             <span className="text-lg font-semibold tracking-tight">SmartDialer</span>
-            <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-              v1.0.0
-            </span>
+            <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">v1.0.0</span>
           </div>
 
           <div className="flex items-center gap-4">
-            {/* API Status Indicator */}
-            <div className="flex items-center gap-1.5 text-sm">
-              <div
-                className={`h-2 w-2 rounded-full ${
-                  apiStatus === 'ok'
-                    ? 'bg-emerald-400 animate-pulse'
-                    : apiStatus === 'error'
-                    ? 'bg-red-400'
-                    : 'bg-amber-400 animate-pulse'
-                }`}
-              />
-              <span className="text-muted-foreground text-xs">
-                {apiStatus === 'ok' ? 'API Connected' : apiStatus === 'error' ? 'API Offline' : 'Connecting…'}
-              </span>
+            {/* Live status */}
+            {simRunning && (
+              <div className="flex items-center gap-1.5 text-xs text-emerald-400">
+                <div className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                Simulation Running
+              </div>
+            )}
+
+            <ConnectionBadge status={wsStatus} />
+
+            {/* Abandoned rate pill */}
+            <div className={cn(
+              'rounded-full px-2.5 py-0.5 text-xs font-medium',
+              abandonedRate > 0.03
+                ? 'bg-red-500/10 text-red-400'
+                : 'bg-emerald-500/10 text-emerald-400'
+            )}>
+              Abandoned: {abandonedPct}%
             </div>
 
-            {/* Theme Toggle */}
             <button
-              onClick={toggleTheme}
+              onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
               className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
             >
               {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -65,164 +86,139 @@ function App() {
         </div>
       </header>
 
-      {/* Main content area */}
-      <main className="p-6">
-        {/* Sprint 1 — Foundation complete banner */}
-        <div className="mb-8 rounded-xl border border-border bg-card p-6">
-          <div className="flex items-start gap-4">
-            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10">
-              <Activity className="h-6 w-6 text-emerald-400" />
+      {/* ── Main Grid ──────────────────────────────────────────── */}
+      <main className="p-6 max-w-screen-xl mx-auto">
+
+        {/* Top KPI strip */}
+        <div className="grid grid-cols-4 gap-4 mb-6">
+          {[
+            {
+              label: 'Available Agents',
+              value: metrics?.agents.available ?? '—',
+              sub: `of ${metrics?.agents.total ?? 0} total`,
+              color: 'text-emerald-400',
+            },
+            {
+              label: 'Active Calls',
+              value: (metrics?.calls.ringing ?? 0) + (metrics?.calls.connected ?? 0) + (metrics?.calls.initiated ?? 0),
+              sub: 'initiated + ringing + connected',
+              color: 'text-violet-400',
+            },
+            {
+              label: 'Completed',
+              value: metrics?.calls.completed ?? '—',
+              sub: 'calls finished successfully',
+              color: 'text-blue-400',
+            },
+            {
+              label: 'Failed',
+              value: metrics?.calls.failed ?? '—',
+              sub: `${abandonedPct}% abandoned rate`,
+              color: abandonedRate > 0.03 ? 'text-red-400' : 'text-slate-400',
+            },
+          ].map(kpi => (
+            <div key={kpi.label} className="rounded-xl border border-border bg-card p-4">
+              <p className="text-xs text-muted-foreground mb-1">{kpi.label}</p>
+              <p className={cn('text-3xl font-bold tabular-nums', kpi.color)}>{kpi.value}</p>
+              <p className="text-xs text-muted-foreground mt-1">{kpi.sub}</p>
             </div>
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight">
-                Sprint 1 — Foundation Complete ✅
-              </h1>
-              <p className="mt-1 text-muted-foreground">
-                Database schema, state machines, and API are ready. Dashboard panels will be built in Sprint 2–3.
+          ))}
+        </div>
+
+        {/* Main content */}
+        <div className="grid gap-4 lg:grid-cols-3">
+
+          {/* Left column — controls + provider health */}
+          <div className="space-y-4">
+            <SimulationControls
+              isRunning={simRunning}
+              onStart={() => setSimRunning(true)}
+              onStop={() => setSimRunning(false)}
+            />
+            <ProviderHealth health={metrics?.provider_health} />
+          </div>
+
+          {/* Middle column — agent pool */}
+          <div className="space-y-4">
+            <AgentPool agents={metrics?.agents} />
+
+            {/* Agent lifecycle explainer */}
+            <div className="rounded-xl border border-border bg-card p-4">
+              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">
+                Agent Lifecycle
+              </p>
+              <div className="flex flex-wrap gap-1.5 text-xs">
+                {[
+                  { label: 'OFFLINE',   color: 'bg-slate-500'   },
+                  { label: '→',         color: ''               },
+                  { label: 'AVAILABLE', color: 'bg-emerald-500' },
+                  { label: '→',         color: ''               },
+                  { label: 'RESERVED',  color: 'bg-sky-400'     },
+                  { label: '→',         color: ''               },
+                  { label: 'DIALING',   color: 'bg-blue-500'    },
+                  { label: '→',         color: ''               },
+                  { label: 'CONNECTED', color: 'bg-violet-500'  },
+                  { label: '→',         color: ''               },
+                  { label: 'WRAP_UP',   color: 'bg-amber-400'   },
+                ].map((item, i) =>
+                  item.color === '' ? (
+                    <span key={i} className="text-muted-foreground">→</span>
+                  ) : (
+                    <span key={item.label} className={cn(item.color, 'rounded px-1.5 py-0.5 text-white font-medium')}>
+                      {item.label}
+                    </span>
+                  )
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground mt-2">
+                <code className="rounded bg-muted px-1 text-[10px]">SELECT FOR UPDATE SKIP LOCKED</code>
+                {' '}prevents double-reservation
               </p>
             </div>
           </div>
-        </div>
 
-        {/* Component Preview Grid */}
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {/* Right column — call metrics */}
+          <div className="space-y-4">
+            <CallMetrics calls={metrics?.calls} />
 
-          {/* Progressive Dialer Card */}
-          <div className="rounded-xl border border-border bg-card p-5 hover:border-primary/50 transition-colors">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="rounded-lg bg-blue-500/10 p-2">
-                <Zap className="h-5 w-5 text-blue-400" />
-              </div>
-              <h2 className="font-semibold">Progressive Dialer</h2>
-              <span className="ml-auto rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-400">
-                Sprint 2
-              </span>
-            </div>
-            <p className="text-sm text-muted-foreground">
-              Strict 1:1 agent-to-call mapping. Never dials more calls than available agents.
-            </p>
-            <div className="mt-4 flex gap-2">
-              <span className="rounded-md bg-muted px-2 py-1 text-xs">SELECT FOR UPDATE</span>
-              <span className="rounded-md bg-muted px-2 py-1 text-xs">SKIP LOCKED</span>
-            </div>
-          </div>
-
-          {/* Safety Controller Card */}
-          <div className="rounded-xl border border-border bg-card p-5 hover:border-primary/50 transition-colors">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="rounded-lg bg-orange-500/10 p-2">
-                <Shield className="h-5 w-5 text-orange-400" />
-              </div>
-              <h2 className="font-semibold">Safety Controller</h2>
-              <span className="ml-auto rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-400">
-                Sprint 3
-              </span>
-            </div>
-            <p className="text-sm text-muted-foreground">
-              Mandatory gate between pacing engine and telecom. Cannot be bypassed.
-            </p>
-            <div className="mt-4 flex flex-wrap gap-2">
-              {['APPROVE', 'REDUCE', 'REJECT', 'FALLBACK'].map(a => (
-                <span key={a} className="rounded-md bg-muted px-2 py-1 text-xs">{a}</span>
-              ))}
-            </div>
-          </div>
-
-          {/* Failure Scenarios Card */}
-          <div className="rounded-xl border border-border bg-card p-5 hover:border-primary/50 transition-colors">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="rounded-lg bg-red-500/10 p-2">
-                <AlertTriangle className="h-5 w-5 text-red-400" />
-              </div>
-              <h2 className="font-semibold">Failure Scenarios</h2>
-              <span className="ml-auto rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-400">
-                Sprint 4
-              </span>
-            </div>
-            <p className="text-sm text-muted-foreground">
-              5 failure scenarios triggerable from the dashboard.
-            </p>
-            <div className="mt-4 space-y-1">
-              {['Worker Crash', 'Provider Outage', 'Agent Drop', 'Duplicate Events', 'Out-of-Order'].map(s => (
-                <div key={s} className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <div className="h-1.5 w-1.5 rounded-full bg-red-400" />
-                  {s}
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* State Machine Status */}
-          <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-5 md:col-span-2 lg:col-span-3">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="rounded-lg bg-emerald-500/10 p-2">
-                <Server className="h-5 w-5 text-emerald-400" />
-              </div>
-              <h2 className="font-semibold">Sprint 1 Deliverables</h2>
-              <span className="ml-auto rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-400 font-medium">
-                ✓ Complete
-              </span>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-              {[
-                { label: 'Agent State Machine', detail: '7 states · SELECT FOR UPDATE SKIP LOCKED' },
-                { label: 'Call State Machine', detail: '9 states · Idempotent · Out-of-order guard' },
-                { label: 'PostgreSQL Schema', detail: '5 tables · indexes · constraints' },
-                { label: 'FastAPI Routes', detail: '/agents · /calls · /campaigns · /health' },
-              ].map(item => (
-                <div key={item.label} className="rounded-lg bg-card border border-border p-3">
-                  <div className="flex items-center gap-2 mb-1">
-                    <div className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                    <span className="text-sm font-medium">{item.label}</span>
+            {/* Call flow explainer */}
+            <div className="rounded-xl border border-border bg-card p-4">
+              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">
+                Call State Machine
+              </p>
+              <div className="space-y-1 text-xs">
+                {[
+                  { from: 'QUEUED', to: 'INITIATED', note: 'Allocator places call' },
+                  { from: 'INITIATED', to: 'RINGING', note: 'Provider event' },
+                  { from: 'RINGING', to: 'ANSWERED', note: 'Borrower picks up' },
+                  { from: 'ANSWERED', to: 'CONNECTED', note: 'Agent patched in' },
+                  { from: 'CONNECTED', to: 'COMPLETED', note: 'Call ends' },
+                  { from: 'ANY', to: 'FAILED', note: 'Idempotent + out-of-order safe' },
+                ].map(row => (
+                  <div key={row.from} className="flex items-center gap-2">
+                    <span className="w-20 text-muted-foreground truncate">{row.from}</span>
+                    <span className="text-muted-foreground">→</span>
+                    <span className="w-20 text-foreground">{row.to}</span>
+                    <span className="text-muted-foreground truncate">{row.note}</span>
                   </div>
-                  <p className="text-xs text-muted-foreground">{item.detail}</p>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
           </div>
 
         </div>
 
-        {/* Agent State Flow Diagram */}
-        <div className="mt-4 rounded-xl border border-border bg-card p-6">
-          <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider mb-4">
-            Agent Lifecycle
-          </h2>
-          <div className="flex flex-wrap items-center gap-2 text-sm">
-            {[
-              { state: 'OFFLINE',    color: 'bg-slate-500' },
-              null,
-              { state: 'AVAILABLE',  color: 'bg-emerald-500' },
-              null,
-              { state: 'RESERVED',   color: 'bg-sky-400' },
-              null,
-              { state: 'DIALING',    color: 'bg-blue-500' },
-              null,
-              { state: 'CONNECTED',  color: 'bg-violet-500' },
-              null,
-              { state: 'WRAP_UP',    color: 'bg-amber-400' },
-            ].map((item, i) =>
-              item === null ? (
-                <span key={i} className="text-muted-foreground">→</span>
-              ) : (
-                <span
-                  key={item.state}
-                  className={`${item.color} rounded-md px-2.5 py-1 text-xs font-medium text-white`}
-                >
-                  {item.state}
-                </span>
-              )
-            )}
+        {/* No data empty state */}
+        {!simRunning && !metrics?.agents.total && (
+          <div className="mt-8 rounded-xl border border-dashed border-border p-12 text-center">
+            <Phone className="h-10 w-10 text-muted-foreground mx-auto mb-3" />
+            <h3 className="text-lg font-semibold mb-1">No simulation running</h3>
+            <p className="text-sm text-muted-foreground">
+              Configure agents and borrowers above, then click <strong>Start Simulation</strong>
+            </p>
           </div>
-          <p className="mt-3 text-xs text-muted-foreground">
-            <strong className="text-foreground">Concurrency safety:</strong>{' '}
-            <code className="rounded bg-muted px-1 py-0.5">SELECT ... FOR UPDATE SKIP LOCKED</code>{' '}
-            ensures no two workers can ever reserve the same agent simultaneously.
-          </p>
-        </div>
+        )}
       </main>
     </div>
   )
 }
-
-export default App
